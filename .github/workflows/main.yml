@@ -76,28 +76,21 @@ jobs:
           Write-Host "Public IP: $publicIP"
           echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
+      - name: Verify RDP Local Port
         run: |
-          Write-Host "Public IP: $env:PUBLIC_IP"
-
-          # Test local/public connectivity to RDP port 3389
-          $testResult = Test-NetConnection -ComputerName $env:PUBLIC_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Warning "Direct external test to $env:PUBLIC_IP on port 3389 returned False (common behind cloud NAT/firewalls). Testing localhost:3389..."
-              $localTest = Test-NetConnection -ComputerName "127.0.0.1" -Port 3389
-              if (-not $localTest.TcpTestSucceeded) {
-                  Write-Error "Local TCP connection to RDP port 3389 failed"
-                  exit 1
-              }
+          $localTest = Test-NetConnection -ComputerName "127.0.0.1" -Port 3389
+          if (-not $localTest.TcpTestSucceeded) {
+              Write-Error "Local TCP connection to RDP port 3389 failed"
+              exit 1
           }
-          Write-Host "RDP service is listening and ready!"
+          Write-Host "RDP service is listening on localhost:3389 (Public IP: $env:PUBLIC_IP)"
 
       - name: Maintain Connection + Watch RDP User
         run: |
           Write-Host "`n=== RDP ACCESS ==="
           Write-Host "Address: $env:PUBLIC_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $(echo$env:RDP_CREDS)"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
           Write-Host "==================`n"
 
           $rdpProfile = "C:\Users\RDP"
