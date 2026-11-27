@@ -9,44 +9,69 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Create RDP User & Prepare Startup
+      - name: Create User
         run: |
-          $password = "MR.English2008"
-          $securePass = ConvertTo-SecureString$password -AsPlainText -Force
+          $pass = "MR.English2008"
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+              New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires
           }
           Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
 
-      - name: Download, Install & Configure RustDesk
+      - name: Install RustDesk and Get ID & Password
         run: |
           $ErrorActionPreference = "Stop"
-
-          # Fetch latest RustDesk Windows x64 MSI/EXE release from GitHub API
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest" -UseBasicParsing
-          $asset =$release.assets | Where-Object { $_.name -match "x86_64\.msi$" } | Select-Object -First 1
-
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest" -UseBasicParsing
+          $asset = $rel.assets | Where-Object { $_.name -match "x86_64\.msi$" } | Select-Object -First 1
           if (-not $asset) {
-              $asset =$release.assets | Where-Object { $_.name -match "x86_64\.exe$" } | Select-Object -First 1
+              $asset = $rel.assets | Where-Object { $_.name -match "x86_64\.exe$" } | Select-Object -First 1
           }
 
-          $installerPath = "$env:TEMP\$($asset.name)"
-          Write-Host "Downloading $($asset.name)..."
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile$installerPath -UseBasicParsing
+          $outFile = "$env:TEMP\$($asset.name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $outFile -UseBasicParsing
 
-          if ($installerPath -like "*.msi") {
-              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/qn", "/norestart" -Wait
-          }
-          else {
-              Start-Process -FilePath $installerPath -ArgumentList "--silent-install" -Wait
+          if ($outFile -like "*.msi") {
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$outFile`"", "/qn", "/norestart" -Wait
+          } else {
+              Start-Process -FilePath $outFile -ArgumentList "--silent-install" -Wait
           }
 
           Start-Sleep -Seconds 5
-          $rustdeskExe = "$env:ProgramFiles\RustDesk\rustdesk.exe"
-
-          # Ensure RustDesk service is running
+          $exe = "$env:ProgramFiles\RustDesk\rustdesk.exe"
           Start-Service -Name "RustDesk" -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 3
 
-          # Set password and fetch RustDesk ID
-          $rdPass = "MR.English2008" & $
+          $tempPass = "MR.English2008"
+          & $exe --password $tempPass
+          Start-Sleep -Seconds 2
+
+          $deskId = ""
+          for ($i = 0; $i -lt 15; $i++) {
+              $deskId = (& $exe --get-id | Out-String).Trim()
+              if ($deskId -match "^\d{6,12}$") { break }
+              Start-Sleep -Seconds 2
+          }
+
+          "RD_ID=$deskId" >> $env:GITHUB_ENV
+          "RD_PASS=$tempPass" >> $env:GITHUB_ENV
+
+      - name: Show Credentials + Run Downloads.bat
+        run: |
+          Write-Host "========================================"
+          Write-Host "RUSTDESK ID:       $env:RD_ID"
+          Write-Host "RUSTDESK PASSWORD: $env:RD_PASS"
+          Write-Host "========================================"
+
+          $url = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          $batPath = "$env:TEMP\Downloads.bat"
+          try {
+              Invoke-WebRequest -Uri $url -OutFile $batPath -UseBasicParsing
+              cmd /c "`"$batPath`""
+          } catch {
+              Write-Host "Downloads.bat error: $($_.Exception.Message)"
+          }
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] Active | ID: $env:RD_ID | Pass: $env:RD_PASS"
+              Start-Sleep -Seconds 300
+          }
