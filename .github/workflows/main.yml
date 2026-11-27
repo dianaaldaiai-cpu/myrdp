@@ -1,17 +1,16 @@
-name: win 11 + tailscale + Download.bat script 
+name: win 11 + tailscale + Download.bat script
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
-    runs-on: windows-2025-vs2026
+    runs-on: windows-2022
     timeout-minutes: 350
 
     steps:
-- name: Configure Core RDP Settings
+      - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
                              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,115 +18,131 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
                              -Name "SecurityLayer" -Value 0 -Force
 
-          # Remove any existing rule with the same name to avoid duplication
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-         
-          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+            dir=in action=allow protocol=TCP localport=3389 profile=any
 
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
           Restart-Service -Name TermService -Force
 
-- name: Create RDP User with Fixed Password
+      - name: Create RDP User with Fixed Password
         run: |
           $password = "MR.English2008"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
               New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-         
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
           echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
-         
+
           if (-not (Get-LocalUser -Name "RDP")) {
               Write-Error "User creation failed"
               exit 1
           }
 
-- name: Install Tailscale
+      - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-         
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-- name: Establish Tailscale Connection
+      - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key and set a unique hostname
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-         
-          # Wait for Tailscale to assign an IP
+
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+          while (-not $tsIP -and $retries -lt 15) {
+              Start-Sleep -Seconds 3
+              $tsIP = (& "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4) -join ""
               $retries++
           }
-         
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
-          }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-     
-- name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-         
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
 
-- name: Maintain Connection + Watch RDP User
+          if (-not $tsIP) {
+              Write-Warning "Tailscale IP not assigned; continuing with public tunnel."
+          }
+          else {
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          }
+
+      - name: Start Public RDP Tunnel
+        run: |
+          $boreExe = "$env:TEMP\bore.exe"
+          $boreLog = "$env:TEMP\bore.log"
+          $boreErr = "$env:TEMP\bore.err"
+          $boreUrl = "https://github.com/ekzhang/bore/releases/latest/download/bore-v0.5.2-x86_64-pc-windows-msvc.exe"
+
+          try {
+              Invoke-WebRequest -Uri $boreUrl -OutFile $boreExe -UseBasicParsing -ErrorAction Stop
+              Start-Process -FilePath $boreExe `
+                  -ArgumentList "local 3389 --to bore.pub" `
+                  -RedirectStandardOutput $boreLog `
+                  -RedirectStandardError $boreErr `
+                  -WindowStyle Hidden
+
+              $publicHost = $null
+              for ($i = 0; $i -lt 15; $i++) {
+                  Start-Sleep -Seconds 1
+                  $raw = ""
+                  if (Test-Path $boreLog) { $raw += (Get-Content $boreLog -Raw -ErrorAction SilentlyContinue) }
+                  if (Test-Path $boreErr) { $raw += (Get-Content $boreErr -Raw -ErrorAction SilentlyContinue) }
+                  if ($raw -match "bore\.pub:(\d+)") {
+                      $publicHost = "bore.pub:$($matches[1])"
+                      break
+                  }
+              }
+
+              if ($publicHost) {
+                  echo "PUBLIC_RDP=$publicHost" >> $env:GITHUB_ENV
+                  Write-Host "PUBLIC RDP ADDRESS: $publicHost"
+              }
+              else {
+                  Write-Warning "Could not parse bore public port yet; check bore.log if needed."
+              }
+          }
+          catch {
+              Write-Warning "Bore download/start failed: $($_.Exception.Message)"
+          }
+
+      - name: Maintain Connection + Watch RDP User
         run: |
           Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "Public Tunnel: $env:PUBLIC_RDP"
+          Write-Host "Tailscale IP:  $env:TAILSCALE_IP"
+          Write-Host "Username:      RDP"
+          Write-Host "Password:      MR.English2008"
           Write-Host "==================`n"
 
           $rdpProfile = "C:\Users\RDP"
           $startupPath = "$rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          $publicStartup = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp"
           $downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
-          $downloadPath = "$startupPath\Downloads.bat"
 
-          while ($true) {
-              if (Test-Path $rdpProfile) {
-                  try {
-                      if (-not (Test-Path $startupPath)) {
-                          New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
-                      }
-
-                      Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
-                      Write-Host "? Downloads.bat copied to $downloadPath"
-
-                      # Run the batch file for the first time
-                      cmd /c $downloadPath
-                      Write-Host "? Downloads.bat executed successfully"
-                      break
-                  }
-                  catch {
-                      Write-Host "? Error copying or executing Downloads.bat: $($_.Exception.Message)"
-                      break
-                  }
+          try {
+              if (-not (Test-Path $rdpProfile)) {
+                  New-Item -ItemType Directory -Path $rdpProfile -Force | Out-Null
               }
-              else {
-                  Write-Host "[$(Get-Date)] Waiting for RDP profile to be created..."
-                  Start-Sleep -Seconds 30
+              if (-not (Test-Path $startupPath)) {
+                  New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
               }
+
+              $downloadPath = "$startupPath\Downloads.bat"
+              Invoke-WebRequest -Uri $downloadUrl -OutFile $downloadPath -UseBasicParsing
+              Copy-Item -Path $downloadPath -Destination "$publicStartup\Downloads.bat" -Force -ErrorAction SilentlyContinue
+              Write-Host "Downloads.bat copied to $downloadPath"
+
+              cmd /c "`"$downloadPath`""
+              Write-Host "Downloads.bat executed successfully"
+          }
+          catch {
+              Write-Host "Error copying or executing Downloads.bat: $($_.Exception.Message)"
           }
 
-          # Keep runner alive
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Write-Host "[$(Get-Date)] RDP Active | Public: $env:PUBLIC_RDP | Tailscale: $env:TAILSCALE_IP"
               Start-Sleep -Seconds 300
           }
